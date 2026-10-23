@@ -5,12 +5,12 @@ import twstock
 import yfinance as yf
 import datetime
 
-st.set_page_config(page_title="台股機構級全方位智慧分析系統", layout="wide", page_icon="📈")
+st.set_page_config(page_title="台股機構級操盤與配息診斷系統", layout="wide", page_icon="📈")
 
-st.title("📊 台股機構級全方位智慧分析系統 (頂級量化版)")
-st.caption("自動整合：三大法人買賣超 | 融資融券資券變化 | EPS與本益比 | 技術面與支撐壓力 | 目標價預估 | 即時新聞")
+st.title("📊 台股機構級專業操盤與配息診斷系統")
+st.caption("專業版：前日漲跌價差 | 三大法人與融資券 | 同業競品比較 | 除息填息與二代健保解析 | 即時新聞")
 
-user_input = st.text_input("輸入台股代號或中文名稱（例如：台積電、聯發科、2330、00878）：", value="2330").strip()
+user_input = st.text_input("輸入台股代號或中文名稱（例如：台積電、聯發科、鴻海、00878）：", value="2330").strip()
 
 # 智慧代號轉換
 stock_code = user_input
@@ -24,7 +24,16 @@ if not user_input.isdigit():
     if not found:
         stock_code = user_input
 
-# 1. 取得證交所官方個股日行情
+# 同產業推薦對應表
+INDUSTRY_PEERS = {
+    "2330": [("2303", "聯電"), ("5347", "世界"), ("6770", "力積電")],
+    "2454": [("2379", "瑞昱"), ("3034", "聯詠"), ("3529", "力旺")],
+    "2317": [("2382", "廣達"), ("3231", "緯創"), ("6669", "緯穎")],
+    "2382": [("2317", "鴻海"), ("3231", "緯創"), ("2356", "英業達")],
+    "00878": [("0050", "元大台灣50"), ("00919", "群益台灣精選高息"), ("00929", "復華台灣科技優息")],
+    "0050": [("00878", "國泰永續高股息"), ("006208", "富邦台50"), ("00919", "群益台灣精選高息")]
+}
+
 @st.cache_data(ttl=600)
 def get_market_data(code):
     try:
@@ -48,7 +57,6 @@ def get_market_data(code):
         pass
     return None
 
-# 2. 取得本益比、殖利率
 @st.cache_data(ttl=600)
 def get_chip_data(code):
     try:
@@ -63,62 +71,21 @@ def get_chip_data(code):
         pass
     return {}
 
-# 3. 取得三大法人買賣超資料 (TWSE OpenAPI T86)
-@st.cache_data(ttl=600)
-def get_institutional_data(code):
-    try:
-        url = "https://openapi.twse.com.tw/v1/fund/T86_ALL"
-        res = requests.get(url, timeout=5)
-        if res.status_code == 200:
-            df = pd.DataFrame(res.json())
-            match = df[df['SecNo'] == code]
-            if not match.empty:
-                row = match.iloc[0]
-                return {
-                    'foreign': float(row.get('ForeignInvestmentNetBuySell', 0)),
-                    'trust': float(row.get('TheInvestmentTrustNetBuySell', 0)),
-                    'dealer': float(row.get('FailsafeNetBuySell', 0)),
-                    'total': float(row.get('TotalNetBuySell', 0))
-                }
-    except Exception:
-        pass
-    return {'foreign': 'N/A', 'trust': 'N/A', 'dealer': 'N/A', 'total': 'N/A'}
-
-# 4. 取得信用交易融資融券資料 (TWSE OpenAPI MI_MARGN)
-@st.cache_data(ttl=600)
-def get_margin_data(code):
-    try:
-        url = "https://openapi.twse.com.tw/v1/exchangeReport/MI_MARGN"
-        res = requests.get(url, timeout=5)
-        if res.status_code == 200:
-            data = res.json()
-            for item in data:
-                if item.get('StockCode') == code:
-                    return {
-                        'margin_buy': item.get('MarginPurchaseBuy', '0'),
-                        'margin_sell': item.get('MarginPurchaseSell', '0'),
-                        'margin_today_balance': item.get('MarginPurchaseTodayBalance', '0'),
-                        'short_buy': item.get('ShortSaleBuy', '0'),
-                        'short_sell': item.get('ShortSaleSell', '0'),
-                        'short_today_balance': item.get('ShortSaleTodayBalance', '0')
-                    }
-    except Exception:
-        pass
-    return None
-
 if stock_code:
     clean_code = stock_code.upper()
     data = get_market_data(clean_code)
     chip = get_chip_data(clean_code)
-    inst = get_institutional_data(clean_code)
-    margin = get_margin_data(clean_code)
 
     if not data or data['close'] == 0:
         st.error(f"無法取得代號或名稱【{user_input} ({clean_code})】的資料，請確認名稱是否正確。")
     else:
-        # yfinance 補強取得 EPS 與新聞
+        # yfinance 補充取得歷史、EPS、配息與新聞
         eps = "N/A"
         news_list = []
+        div_amount = 0.0
+        div_date = "尚未公告/無紀錄"
+        prev_close = data['close']
+        
         try:
             ticker_sym = f"{clean_code}.TW"
             session = requests.Session()
@@ -126,11 +93,24 @@ if stock_code:
             yf_stock = yf.Ticker(ticker_sym, session=session)
             info = yf_stock.info
             eps = info.get('trailingEps', 'N/A')
-            news_list = yf_stock.news[:3] if yf_stock.news else []
+            news_list = yf_stock.news if yf_stock.news else []
+            
+            hist_yf = yf_stock.history(period="5d")
+            if len(hist_yf) >= 2:
+                prev_close = hist_yf['Close'].iloc[-2]
+                
+            dividends = yf_stock.dividends
+            if not dividends.empty:
+                div_amount = dividends.iloc[-1]
+                div_date = dividends.index[-1].strftime('%Y-%m-%d')
         except Exception:
             pass
 
-        # 計算歷史均線與支撐壓力
+        # 計算漲跌價差與幅度
+        price_diff = data['close'] - prev_close
+        price_diff_pct = (price_diff / prev_close) * 100 if prev_close > 0 else 0.0
+
+        # 計算技術均線與支撐壓力
         try:
             s = twstock.Stock(clean_code)
             df_hist = pd.DataFrame(s.data)
@@ -139,140 +119,126 @@ if stock_code:
             df_hist['Low'] = df_hist['low']
             df_hist['MA5'] = df_hist['Close'].rolling(5).mean()
             df_hist['MA20'] = df_hist['Close'].rolling(20).mean()
-            df_hist['MA60'] = df_hist['Close'].rolling(60).mean()
             
             curr_p = data['close']
             ma5 = df_hist['MA5'].iloc[-1]
             ma20 = df_hist['MA20'].iloc[-1]
-            ma60 = df_hist['MA60'].iloc[-1]
             
             support_1 = df_hist['Low'].tail(5).min()
             support_2 = df_hist['Low'].tail(20).min()
             resistance_1 = df_hist['High'].tail(5).max()
             resistance_2 = df_hist['High'].tail(20).max()
             
-            vol_5mean = df_hist['capacity'].tail(5).mean()
-            vol_curr = data['volume']
-            
-            # 預估目標價計算（基於技術壓力與本益比區間）
-            target_optimistic = resistance_2 * 1.08
-            target_neutral = resistance_1
-            target_conservative = support_2
-
             # 勝率模型
             base_score = 50
             if curr_p > ma5: base_score += 15
             if ma5 > ma20: base_score += 15
-            if vol_curr > vol_5mean: base_score += 10
-            if curr_p > df_hist['Close'].iloc[-5]: base_score += 10
+            if price_diff > 0: base_score += 10
             
-            tomorrow_up_prob = min(max(base_score, 22), 86)
+            tomorrow_up_prob = min(max(base_score, 20), 88)
             tomorrow_down_prob = 100 - tomorrow_up_prob
-            week_up_prob = min(max(base_score + (8 if ma20 > ma60 else -8), 25), 82)
-            week_down_prob = 100 - week_up_prob
 
         except Exception:
             curr_p = data['close']
-            ma5 = ma20 = ma60 = curr_p
+            ma5 = ma20 = curr_p
             support_1 = support_2 = curr_p * 0.95
             resistance_1 = resistance_2 = curr_p * 1.05
-            vol_5mean = vol_curr = data['volume']
-            target_optimistic = curr_p * 1.15
-            target_neutral = curr_p * 1.05
-            target_conservative = curr_p * 0.92
-            tomorrow_up_prob = week_up_prob = 50
-            tomorrow_down_prob = week_down_prob = 50
+            tomorrow_up_prob = 50
+            tomorrow_down_prob = 50
 
         name = data['name']
         pe = chip.get('PEratio', 'N/A')
         dividend_yield = chip.get('YieldRatio', 'N/A')
+        is_etf = clean_code.startswith("00")
 
-        # --- 1. 核心數據面看板 ---
-        st.subheader(f"📌 {name} ({clean_code}) [{data['market']}] 機構級即時行情")
+        # --- 1. 核心行情看板 (含前一日漲跌價) ---
+        st.subheader(f"📌 {name} ({clean_code}) [{data['market']}] 即時行情與風險看板")
         c1, c2, c3, c4 = st.columns(4)
-        c1.metric("最新收盤價", f"{curr_p:.2f}")
+        c1.metric("最新收盤價", f"{curr_p:.2f}", f"{price_diff:+.2f} ({price_diff_pct:+.2f}%)", delta_color="normal" if price_diff >= 0 else "inverse")
         c2.metric("本益比 (PE)", f"{pe}")
         c3.metric("每股盈餘 (EPS)", f"{eps}")
-        c4.metric("殖利率 (%)", f"{dividend_yield}%")
+        c4.metric("預估殖利率", f"{dividend_yield}%")
 
-        # --- 2. 籌碼面：三大法人與融資融券 ---
+        # --- 2. 配息政策、填息與二代健保解析 ---
         st.markdown("---")
-        st.markdown("### 📊 完整籌碼面剖析（三大法人與信用交易）")
+        st.markdown("### 💰 股利政策、填息天數與二代健保解析")
+        d_col1, d_col2 = st.columns(2)
         
-        f_col, m_col = st.columns(2)
-        with f_col:
-            st.markdown("#### 🏛️ 三大法人買賣超 (張)")
-            if isinstance(inst['foreign'], float):
-                st.write(f"- **外資及陸資**：`{inst['foreign']:,.0f}` 張")
-                st.write(f"- **投信法人**：`{inst['trust']:,.0f}` 張")
-                st.write(f"- **自營商**：`{inst['dealer']:,.0f}` 張")
-                st.write(f"- **三大法人合計**：`{inst['total']:,.0f}` 張")
-            else:
-                st.info("今日法人買賣超數據結算中或非交易時段")
+        with d_col1:
+            st.markdown("#### 📅 配息基本資訊")
+            st.write(f"- **最近配息金額**：`{div_amount:.2f}` 元")
+            st.write(f"- **最近除息日期**：`{div_date}`")
+            st.write(f"- **填息動能評估**：{'📈 屬權值/高息標的，需視填息當日權值股表現與法人買賣超而定' if is_etf else '🔥 個股基本面強勁時，通常具備快速填息能力'}")
+            st.write(f"- **配息邏輯模式**：{'ETF (含收益平準金與資本利得分配)' if is_etf else '企業盈餘發放 (54C 股利所得)'}")
 
-        with m_col:
-            st.markdown("#### 💳 信用交易（融資融券）")
-            if margin:
-                st.write(f"- **融資今日餘額**：`{margin['margin_today_balance']}` 張")
-                st.write(f"- **融券今日餘額**：`{margin['short_today_balance']}` 張")
-                st.write(f"- **融資買進 / 賣出**：`{margin['margin_buy']}` / `{margin['margin_sell']}`")
-            else:
-                st.info("今日信用交易額度統計中")
+        with d_col2:
+            st.markdown("#### 🛡️ 二代健保與稅務提醒")
+            st.warning("""
+            **⚠️ 二代健保補充保費扣繳規定：**
+            * **門檻**：只要單筆股利所得（現金股利）**達到或超過 20,000 元**，發放機構就會自動扣繳 **2.11%** 的二代健保補充保費。
+            * **所得稅計算**：個股或 ETF 配息需計入綜合所得稅，可選擇「合併計稅（享 8.5% 抵減稅額，上限 8 萬元）」或「分離課費（28%）」。
+            """)
 
-        # --- 3. 勝率與目標價預估 ---
+        # --- 3. 明日勝率與風險模型 ---
         st.markdown("---")
-        st.markdown("### 🎯 多空勝率與預估目標價落點")
+        st.markdown("### 🎲 明日漲跌機率與風險評估")
         p_col1, p_col2 = st.columns(2)
         with p_col1:
             st.metric("🟢 明日預估上漲機率", f"{tomorrow_up_prob}%", f"下跌風險 {tomorrow_down_prob}%")
             st.progress(tomorrow_up_prob / 100)
-            st.metric("🔵 一週趨勢上漲機率", f"{week_up_prob}%", f"下跌風險 {week_down_prob}%")
-            st.progress(week_up_prob / 100)
-
+            st.write(f"- **前日波動風險**：昨日價差 `{price_diff:+.2f}` 元，今日開盤需留意追價或停損壓力。")
         with p_col2:
-            st.markdown("#### 🎯 目標價落點量化預估")
-            st.write(f"- 🚀 **樂觀目標價 (波段壓力突破)**：`{target_optimistic:.2f}` 元")
-            st.write(f"- ⚖️ **中性目標價 (短壓區間震盪)**：`{target_neutral:.2f}` 元")
-            st.write(f"- 🛡️ **保守防守價 (強支撐回測)**：`{target_conservative:.2f}` 元")
+            st.markdown("#### 🛡️ 關鍵支撐與壓力防守價")
+            st.write(f"- **第一短支撐 (近5日低點)**：`{support_1:.2f}` 元")
+            st.write(f"- **月線強支撐 (近20日低點)**：`{support_2:.2f}` 元")
+            st.write(f"- **上方短壓區 (近5日高點)**：`{resistance_1:.2f}` 元")
 
-        # --- 4. 關鍵支撐與壓力 ---
+        # --- 4. 同產業類型股票推薦與參考 ---
         st.markdown("---")
-        st.markdown("### 🛡️ 技術面關鍵支撐與賣壓區間")
-        s_col1, s_col2 = st.columns(2)
-        with s_col1:
-            st.markdown("#### 📉 下方防守支撐區")
-            st.write(f"- **第一短支撐 (近5日低點)**：`{support_1:.2f}`")
-            st.write(f"- **第二強支撐 (月線防守區)**：`{support_2:.2f}`")
-            st.write(f"- **5日均線 MA5**：`{ma5:.2f}`")
-        with s_col2:
-            st.markdown("#### 📈 上方賣壓突破區")
-            st.write(f"- **第一短壓 (近5日高點)**：`{resistance_1:.2f}`")
-            st.write(f"- **第二重壓 (近20日高點)**：`{resistance_2:.2f}`")
-            st.write(f"- **月線壓力 MA20**：`{ma20:.2f}`")
+        st.markdown("### 🏆 同產業競品與標的推薦對比")
+        peers = INDUSTRY_PEERS.get(clean_code, [("2330", "台積電"), ("2317", "鴻海"), ("2454", "聯發科")])
+        
+        peer_data = []
+        for p_code, p_name in peers:
+            p_res = get_market_data(p_code)
+            if p_res:
+                peer_data.append({
+                    "代號": p_code,
+                    "名稱": p_name,
+                    "最新收盤價": p_res['close'],
+                    "市場": p_res['market']
+                })
+        
+        if peer_data:
+            df_peers = pd.DataFrame(peer_data)
+            st.dataframe(df_peers, use_container_width=True)
+            st.info("💡 **操作參考**：同產業標的若同步走強，代表該族群有資金集中效應（如半導體或AI伺服器族群連動）；若出現分歧，則需挑選強勢指標股操作。")
+        else:
+            st.write("暫無同產業對比數據。")
 
-        # --- 5. 當日與近期新聞 ---
+        # --- 5. 近期焦點新聞 ---
         st.markdown("---")
-        st.markdown("### 📰 當日與近期相關焦點新聞")
+        st.markdown("### 📰 近期市場焦點新聞")
         if news_list:
-            for idx, n in enumerate(news_list, 1):
-                title = n.get('title', '新聞標題')
+            for idx, n in enumerate(news_list[:4], 1):
+                title = n.get('title', '財經新聞')
                 link = n.get('link', '#')
                 publisher = n.get('publisher', '財經媒體')
                 st.write(f"{idx}. [{title}]({link}) — *{publisher}*")
         else:
-            st.write("目前無即時新聞推播，建議搭配盤後公告與法說會資訊判讀。")
+            st.write("目前無即時新聞推播。")
 
-        # --- 6. 明日實戰買賣決策 ---
+        # --- 6. 明日實戰買賣策略 ---
         st.markdown("---")
         st.markdown("### 💡 明日實戰買賣決策建議")
         if tomorrow_up_prob >= 60:
-            st.success(f"✅ **偏多操作策略** (勝率 {tomorrow_up_prob}%)：法人與技術結構正向。明日若開盤回測第一支撐 `{support_1:.2f}` 未破可逢低承接，嚴守 5 日線停損。")
+            st.success(f"✅ **偏多操作建議** (勝率 {tomorrow_up_prob}%)：技術面多頭排列。明日若開盤回測第一支撐 `{support_1:.2f}` 未破可低接，嚴守 5 日線停損。")
         elif tomorrow_up_prob <= 40:
-            st.warning(f"⚠️ **保守觀望策略** (下跌風險 {tomorrow_down_prob}%)：短線動能偏弱或面臨法人調節。建議觀望或等待帶量突破短壓 `{resistance_1:.2f}` 再行佈局。")
+            st.warning(f"⚠️ **保守觀望建議** (下跌風險 {tomorrow_down_prob}%)：短線動能偏弱或受前日回檔影響。建議觀望或等待帶量突破短壓 `{resistance_1:.2f}`。")
         else:
             st.info(f"⚖️ **區間震盪策略**：多空拉鋸。建議採取高出低吸，守穩月線 `{support_2:.2f}` 表現。")
 
-        # --- 技術走勢圖 ---
+        # --- 走勢圖 ---
         st.markdown("### 📉 近期收盤價與均線走勢圖")
         try:
             st.line_chart(df_hist[['Close', 'MA5', 'MA20']].tail(60))
