@@ -2,14 +2,26 @@ import streamlit as st
 import yfinance as yf
 import pandas as pd
 import requests
-import datetime
+import twstock
 
 st.set_page_config(page_title="台股智慧全自動診斷系統", layout="wide", page_icon="📈")
 
-st.title("📊 台股全方位智慧分析系統 (iPad 自動解讀版)")
-st.caption("自動整合：技術面 | 籌碼融資券 | 除權息與配息來源 | 明日極速買賣決策 | 100% 免費雲端")
+st.title("📊 台股全方位智慧分析系統 (全自動智能解析版)")
+st.caption("支援輸入任意台股代號或中文名稱：自動聯動技術、籌碼、除權息與 AI 決策")
 
-stock_code = st.text_input("輸入台股/ETF代號（例如：2330, 2454, 00878, 00919）：", value="2330").strip()
+user_input = st.text_input("輸入台股代號或中文名稱（例如：台積電、聯發科、2330、00878）：", value="台積電").strip()
+
+# 利用 twstock 自動智慧對應任意中文名稱或代號
+stock_code = user_input
+if not user_input.isdigit():
+    found = False
+    for code, info in twstock.codes.items():
+        if user_input in info.name:
+            stock_code = code
+            found = True
+            break
+    if not found:
+        stock_code = user_input
 
 def get_twse_chip_data(stock_id):
     try:
@@ -28,8 +40,7 @@ if stock_code:
     clean_code = stock_code.upper()
     ticker_symbol = f"{clean_code}.TW" if clean_code.isdigit() else clean_code
 
-    with st.spinner("正在自動彙整雲端數據（股價、籌碼、股利政策與新聞）..."):
-        # 建立帶有瀏覽器標頭的 session，防止雲端伺服器被 Yahoo 阻擋
+    with st.spinner(f"正在自動聯動雲端資料庫查詢 【{user_input} ({clean_code})】..."):
         session = requests.Session()
         session.headers.update({
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
@@ -44,12 +55,11 @@ if stock_code:
             hist = stock.history(period="6m")
 
         if hist.empty:
-            st.error(f"無法取得代號【{stock_code}】的數據，請確認輸入是否正確。")
+            st.error(f"無法取得代號或名稱【{user_input}】的數據，請確認名稱是否正確（或直接輸入數字代號）。")
         else:
             info = stock.info
             twse_info = get_twse_chip_data(clean_code)
             
-            # 均線與技術計算
             hist['MA5'] = hist['Close'].rolling(5).mean()
             hist['MA20'] = hist['Close'].rolling(20).mean()
             hist['MA60'] = hist['Close'].rolling(60).mean()
@@ -64,7 +74,6 @@ if stock_code:
             vol_curr = hist['Volume'].iloc[-1]
             vol_ma5 = hist['Volume'].tail(5).mean()
 
-            # 配息相關數據抓取
             dividends = stock.dividends
             last_div_amount = dividends.iloc[-1] if not dividends.empty else 0.0
             last_div_date = dividends.index[-1].strftime('%Y-%m-%d') if not dividends.empty else "無紀錄/尚未公告"
@@ -74,7 +83,6 @@ if stock_code:
             quote_type = info.get('quoteType', '')
             is_etf = quote_type == 'ETF' or clean_code.startswith("00")
             
-            # --- 第一區塊：行情與除權息指標 ---
             st.subheader(f"📌 {info.get('longName', clean_code)} ({clean_code}) 核心數據")
             c1, c2, c3, c4 = st.columns(4)
             c1.metric("最新收盤價", f"{curr_p:.2f}", f"{chg:+.2f} ({chg_pct:+.2f}%)")
@@ -82,17 +90,15 @@ if stock_code:
             c3.metric("最近除息日期", f"{last_div_date}")
             c4.metric("預估年化殖利率", div_yield_str)
 
-            # --- 第二區塊：配息模式與收益來源分析 ---
             st.markdown("### 💰 股利政策與收益來源結構")
             d1, d2 = st.columns(2)
             if is_etf:
-                d1.info("💡 **標的屬性：ETF 基金**\n- **配息模式**：常見為月配、季配或半年配（視公開說明書而定）。\n- **收益來源組成**：54C股利所得、財產交易所得（資本利得）、收益平準金、利息所得。")
-                d2.warning("⚠️ **配息提醒**：若配息來源含有高比例「收益平準金」或「資本利得」，代表並非全部來自企業實際獲利，除息前需評估填息動能。")
+                d1.info("💡 **標的屬性：ETF 基金**\n- **配息模式**：常見為月配、季配或半年配。\n- **收益來源組成**：54C股利所得、資本利得、收益平準金。")
+                d2.warning("⚠️ **配息提醒**：若配息來源含有高比例平準金或資本利得，除息前需評估填息動能。")
             else:
-                d1.info("💡 **標的屬性：一般企業股票**\n- **配息模式**：年配或半年配/季配（如台積電）。\n- **收益來源組成**：主要為公司累積盈餘分配（54C股利所得）。")
-                d2.warning("⚠️ **填息評估**：個股配息需評估扣抵稅率與補充保費（單筆達2萬元），並以基本面成長力道做為填息依據。")
+                d1.info("💡 **標的屬性：一般企業股票**\n- **配息模式**：年配或季配。\n- **收益來源組成**：主要為企業獲利盈餘分配。")
+                d2.warning("⚠️ **填息評估**：個股需評估基本面成長力道與補充保費。")
 
-            # --- 第三區塊：技術面與量能 ---
             st.markdown("### 📈 技術面均線與支撐壓力")
             t1, t2, t3, t4 = st.columns(4)
             t1.metric("5日線 (短線防守)", f"{hist['MA5'].iloc[-1]:.2f}")
@@ -102,7 +108,6 @@ if stock_code:
 
             st.line_chart(hist[['Close', 'MA5', 'MA20', 'MA60']])
 
-            # --- 第四區塊：最新新聞 ---
             st.markdown("### 📰 相關即時焦點新聞")
             news_list = stock.news[:3] if stock.news else []
             news_summary = ""
@@ -115,7 +120,6 @@ if stock_code:
             else:
                 st.write("暫無最新全球/英文焦點新聞")
 
-            # --- 第五區塊：一鍵生成 Gemini 全方位解析 prompt ---
             st.markdown("---")
             st.markdown("### 🤖 一鍵複製：Gemini 全方位極致診斷指令")
             st.info("點擊下方程式碼區塊右上角的複製按鈕，直接貼給 Gemini，系統將為你產出明日買賣操作指令！")
