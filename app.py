@@ -29,12 +29,18 @@ if stock_code:
     ticker_symbol = f"{clean_code}.TW" if clean_code.isdigit() else clean_code
 
     with st.spinner("正在自動彙整雲端數據（股價、籌碼、股利政策與新聞）..."):
-        stock = yf.Ticker(ticker_symbol)
+        # 建立帶有瀏覽器標頭的 session，防止雲端伺服器被 Yahoo 阻擋
+        session = requests.Session()
+        session.headers.update({
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+        })
+        
+        stock = yf.Ticker(ticker_symbol, session=session)
         hist = stock.history(period="6m")
         
         if hist.empty and clean_code.isdigit():
             ticker_symbol = f"{clean_code}.TWO"
-            stock = yf.Ticker(ticker_symbol)
+            stock = yf.Ticker(ticker_symbol, session=session)
             hist = stock.history(period="6m")
 
         if hist.empty:
@@ -65,7 +71,6 @@ if stock_code:
             div_yield = info.get('dividendYield', 0)
             div_yield_str = f"{div_yield * 100:.2f}%" if div_yield else f"{twse_info.get('YieldRatio', 'N/A')}%"
 
-            # 區分 ETF 與 一般股票之配息模式研判
             quote_type = info.get('quoteType', '')
             is_etf = quote_type == 'ETF' or clean_code.startswith("00")
             
