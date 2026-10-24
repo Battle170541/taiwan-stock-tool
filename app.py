@@ -431,8 +431,15 @@ if hist.empty:
 df = calc_indicators(hist)
 last = df.iloc[-1]; prev = df.iloc[-2] if len(df) > 1 else last
 close = safe_num(last["Close"]); prev_close = safe_num(prev["Close"])
-change = close - prev_close if close and prev_close else None
-change_pct = change / prev_close * 100 if change and prev_close else None
+
+# 安全防呆計算差值與漲跌幅
+if close is not None and prev_close is not None:
+    change = close - prev_close
+    change_pct = (change / prev_close) * 100
+    delta_str = f"{change:+.2f}（{change_pct:+.2f}%）"
+else:
+    delta_str = None
+
 display_name = (quote or {}).get("name") or STOCKS.get(code, {}).get("name") or info.get("shortName") or code
 industry = STOCKS.get(code, {}).get("industry", info.get("industry", "尚未分類"))
 source_stamp = df.index[-1].strftime("%Y-%m-%d")
@@ -442,7 +449,7 @@ st.markdown(f"## 📌 {display_name}（{code}）")
 st.caption(f"市場資料日期：{source_stamp}｜代號：{symbol}｜Yahoo Finance / TWSE OpenAPI")
 
 m1,m2,m3,m4,m5 = st.columns(5)
-m1.metric("收盤價", fmt_num(close), f"{change:+.2f}（{change_pct:+.2f}%）" if change is not None else None)
+m1.metric("收盤價", fmt_num(close), delta_str)
 m2.metric("成交量（張）", fmt_num(latest_volume_lots,0))
 m3.metric("當日高點", fmt_num(last["High"]))
 m4.metric("當日低點", fmt_num(last["Low"]))
