@@ -30,6 +30,10 @@ st.markdown("""
     }
     [data-testid="stMetricLabel"] { color: #aab6c5; }
     div[data-testid="stMetricValue"] { font-weight: 750; }
+    div[data-testid="stMetricValue"] > div { white-space: normal !important; overflow-wrap: anywhere !important; font-size: clamp(1.0rem, 2.0vw, 1.75rem) !important; }
+    [data-testid="stMetricDelta"] { white-space: normal !important; }
+    .stDataFrame { width: 100%; }
+    div[data-testid="stHorizontalBlock"] { gap: .65rem; }
     .block-container { padding-top: 1.2rem; padding-bottom: 2rem; }
     .section-note { color: #9aa8b8; font-size: .88rem; }
     div[data-testid="stTabs"] button { font-weight: 650; }
@@ -179,7 +183,183 @@ def calc_indicators(df):
     x["BB_up"] = mid + 2*sd
     x["BB_low"] = mid - 2*sd
     x["VOL_MA5"] = x["Volume"].rolling(5).mean()
+    # ATR(14) for volatility-aware levels
+    prev_close = x["Close"].shift(1)
+    tr = pd.concat([
+        x["High"] - x["Low"],
+        (x["High"] - prev_close).abs(),
+        (x["Low"] - prev_close).abs()
+    ], axis=1).max(axis=1)
+    x["ATR14"] = tr.rolling(14).mean()
+    # Pivot levels based on prior completed session
+    x["PIVOT"] = (x["High"].shift(1) + x["Low"].shift(1) + x["Close"].shift(1)) / 3
+    x["S1"] = 2*x["PIVOT"] - x["High"].shift(1)
+    x["R1"] = 2*x["PIVOT"] - x["Low"].shift(1)
     return x
+
+
+def technical_score_frame(x):
+    """Score known at close t; used against the following session to avoid look-ahead."""
+    z = x.copy()
+    score = pd.Series(0, index=z.index, dtype=float)
+    for ma in ["MA5", "MA20", "MA60"]:
+        score += np.where(z["Close"] > z[ma], 1, np.where(z["Close"] < z[ma], -1, 0))
+    score += np.where(z["MACD"] > z["MACD_signal"], 1,
+                      np.where(z["MACD"] < z["MACD_signal"], -1, 0))
+    z["SignalScore"] = score
+    return z
+
+
+def historical_probabilities(x):
+    """Historical conditional frequencies, not a guarantee or a trained predictive model."""
+    z = technical_score_frame(x).copy()
+    current_score = int(z["SignalScore"].iloc[-1])
+    next_close = z["Close"].shift(-1)
+    next_open = z["Open"].shift(-1)
+    z["NextCloseUp"] = np.where(next_close.notna(), (next_close > z["Close"]).astype(float), np.nan)
+    z["NextSessionGreen"] = np.where(next_close.notna() & next_open.notna(), (next_close > next_open).astype(float), np.nan)
+    z["NextCloseReturn"] = next_close / z["Close"] - 1
+    z = z.iloc[:-1].dropna(subset=["SignalScore", "NextCloseUp", "NextSessionGreen"])
+    if z.empty:
+        return {}
+    # Similar-score historical observations; broad enough to avoid a tiny exact-score sample.
+    similar = z[z["SignalScore"].between(current_score-1, current_score+1)]
+    if len(similar) < 15:
+        similar = z
+    return {
+        "overnight_up": float(similar["NextCloseUp"].mean() * 100),
+        "intraday_green": float(similar["NextSessionGreen"].mean() * 100),
+        "n": int(len(similar)),
+        "score": current_score,
+        "sample_start": similar.index.min().strftime("%Y-%m-%d"),
+        "sample_end": similar.index.max().strftime("%Y-%m-%d"),
+    }
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def get_official_json(url):
+    try:
+        r = requests.get(url, headers=HEADERS, timeout=TIMEOUT)
+        r.raise_for_status()
+        return r.json()
+    except Exception:
+        return None
+
+
+def get_twse_day_history(code, date_yyyymmdd):
+    url = f"https://www.twse.com.tw/rwd/zh/afterTrading/STOCK_DAY?date={date_yyyymmdd}&stockNo={quote(str(code))}&response=json"
+    return get_official_json(url)
+
+
+def get_twse_margin_day(date_yyyymmdd):
+    url = f"https://www.twse.com.tw/rwd/zh/marginTrading/MI_MARGN?date={date_yyyymmdd}&selectType=ALL&response=json"
+    return get_official_json(url)
+
+
+def get_twse_institution_day(date_yyyymmdd):
+    url = f"https://www.twse.com.tw/rwd/zh/fund/T86?date={date_yyyymmdd}&selectType=ALLBUT0999&response=json"
+    return get_official_json(url)
+
+
+def _find_table_rows(payload, code):
+    """Find a row whose first column matches stock code, handling TWSE JSON table layouts."""
+    if not isinstance(payload, dict):
+        return None, None
+    tables = payload.get("tables")
+    if isinstance(tables, list):
+        for table in tables:
+            fields = table.get("fields", [])
+            rows = table.get("data", [])
+            if not rows:
+                continue
+            for row in rows:
+                if row and str(row[0]).strip() == str(code):
+                    return fields, row
+    fields = payload.get("fields", [])
+    rows = payload.get("data", [])
+    if isinstance(rows, list):
+        for row in rows:
+            if row and str(row[0]).strip() == str(code):
+                return fields, row
+    return None, None
+
+
+def _num_cell(value):
+    try:
+        return float(str(value).replace(",", "").replace("--", "0").replace("X", "").strip())
+    except Exception:
+        return np.nan
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def get_recent_chip_data(code, days=5):
+    """Fetch recent official TWSE daily data; unsupported/missing dates remain missing."""
+    rows = []
+    # Iterate a generous calendar window and retain the latest available trading dates.
+    today = datetime.now()
+    dates = pd.date_range(end=today.normalize(), periods=18, freq="D")[::-1]
+    for dt in dates:
+        date_s = dt.strftime("%Y%m%d")
+        # weekends/holidays naturally return no matching rows
+        daily = get_twse_day_history(code, date_s)
+        rows_daily = daily.get("data", []) if isinstance(daily, dict) else []
+        target_roc = f"{dt.year-1911}/{dt.month:02d}/{dt.day:02d}"
+        row = None
+        for candidate in rows_daily:
+            if candidate and str(candidate[0]).strip().replace("-", "/") == target_roc:
+                row = candidate
+                break
+        if row is None:
+            continue
+        # STOCK_DAY data fields typically: 日期, 成交股數, 成交金額, 開盤價, 最高價, 最低價, 收盤價, 漲跌價差, 成交筆數
+        def dval(idx):
+            return _num_cell(row[idx]) if len(row) > idx else np.nan
+        item = {
+            "日期": str(row[0]),
+            "成交量(張)": dval(1) / 1000,
+            "開盤價": dval(3), "最高價": dval(4), "最低價": dval(5), "收盤價": dval(6),
+            "融資買進(張)": np.nan, "融資賣出(張)": np.nan, "融資餘額(張)": np.nan,
+            "融券買進(張)": np.nan, "融券賣出(張)": np.nan, "融券餘額(張)": np.nan,
+            "外資買賣超(張)": np.nan, "投信買賣超(張)": np.nan, "自營商買賣超(張)": np.nan,
+        }
+        margin = get_twse_margin_day(date_s)
+        mfields, mrow = _find_table_rows(margin, code)
+        if mrow is not None and mfields:
+            # Map by field names rather than assuming one fixed column order.
+            for j, field in enumerate(mfields):
+                if j >= len(mrow): continue
+                f = str(field)
+                val = _num_cell(mrow[j])
+                if "融資買進" in f: item["融資買進(張)"] = val
+                elif "融資賣出" in f: item["融資賣出(張)"] = val
+                elif "融資今日餘額" in f or "融資餘額" in f: item["融資餘額(張)"] = val
+                elif "融券買進" in f: item["融券買進(張)"] = val
+                elif "融券賣出" in f: item["融券賣出(張)"] = val
+                elif "融券今日餘額" in f or "融券餘額" in f: item["融券餘額(張)"] = val
+            # TWSE margin report figures are shares/units in lots of 1,000; normalize if large.
+            for k in ["融資買進(張)","融資賣出(張)","融資餘額(張)","融券買進(張)","融券賣出(張)","融券餘額(張)"]:
+                if pd.notna(item[k]) and abs(item[k]) > 100000:
+                    item[k] = item[k] / 1000
+        inst = get_twse_institution_day(date_s)
+        ifields, irow = _find_table_rows(inst, code)
+        if irow is not None and ifields:
+            for j, field in enumerate(ifields):
+                if j >= len(irow): continue
+                f = str(field)
+                val = _num_cell(irow[j])
+                # T86 columns are share counts; convert to lots
+                if "外陸資買賣超股數" in f or "外資及陸資買賣超股數" in f:
+                    item["外資買賣超(張)"] = val / 1000
+                elif "投信買賣超股數" in f:
+                    item["投信買賣超(張)"] = val / 1000
+                elif "自營商買賣超股數" in f:
+                    item["自營商買賣超(張)"] = val / 1000
+        rows.append(item)
+        if len(rows) >= days:
+            break
+    if not rows:
+        return pd.DataFrame()
+    return pd.DataFrame(rows).sort_values("日期", ascending=False)
 
 def make_chart(df, show_ma, show_bb, show_macd, show_rsi, show_kd):
     rows = 2 + int(show_macd) + int(show_rsi) + int(show_kd)
@@ -360,7 +540,7 @@ m3.metric("當日高點", fmt_num(last["High"]))
 m4.metric("當日低點", fmt_num(last["Low"]))
 m5.metric("產業分類", industry)
 
-tabs = st.tabs(["📈 技術分析","🔗 產業與同業","💰 基本面","🧭 交易計畫","ℹ️ 資料品質"])
+tabs = st.tabs(["📈 技術分析","🔗 產業與同業","💰 基本面","🎯 交易策略／目標價","📊 近一週籌碼","ℹ️ 資料品質"])
 
 with tabs[0]:
     left, right = st.columns([2,1])
@@ -428,45 +608,123 @@ with tabs[2]:
     st.caption("Yahoo Finance 欄位可能缺漏、延遲或與公司公告口徑不同；正式交易前應以公開資訊觀測站與交易所公告核對。月營收歷史圖、毛利率、現金流與估值歷史分位數可在下一版接入官方資料源。")
 
 with tabs[3]:
-    st.subheader("明日交易計畫（規則式分析，不是預測保證）")
-    close_now = safe_num(last["Close"])
-    ma5 = safe_num(last["MA5"]); ma20 = safe_num(last["MA20"]); ma60 = safe_num(last["MA60"])
-    vol = safe_num(last["Volume"]); volma = safe_num(last["VOL_MA5"])
-    macd = safe_num(last["MACD"]); macds = safe_num(last["MACD_signal"])
-    signals = []
-    score = 0
-    if ma5 and close_now > ma5: score += 1; signals.append("收盤價高於 MA5（短線偏多）")
-    elif ma5: score -= 1; signals.append("收盤價低於 MA5（短線偏弱）")
-    if ma20 and close_now > ma20: score += 1; signals.append("收盤價高於 MA20（波段結構較強）")
-    elif ma20: score -= 1; signals.append("收盤價低於 MA20（波段結構較弱）")
-    if ma60 and close_now > ma60: score += 1; signals.append("收盤價高於 MA60（中期趨勢較強）")
-    elif ma60: score -= 1; signals.append("收盤價低於 MA60（中期趨勢較弱）")
-    if macd is not None and macds is not None:
-        if macd > macds: score += 1; signals.append("MACD 高於訊號線（動能偏多）")
-        else: score -= 1; signals.append("MACD 低於訊號線（動能偏弱）")
-    if vol is not None and volma is not None and volma > 0:
-        signals.append("成交量高於 5 日均量" if vol > volma else "成交量未高於 5 日均量")
-    if score >= 2:
-        st.success("技術條件：偏多。優先等待拉回量縮、支撐不破，或帶量突破後確認。")
-    elif score <= -2:
-        st.error("技術條件：偏空／防守。避免只因價格下跌就接刀，先觀察是否止跌及重新站回關鍵均線。")
-    else:
-        st.warning("技術條件：中性／等待。多空訊號未形成明顯一致，避免為了交易而交易。")
-    st.write("**目前觀察訊號**")
-    for s in signals:
-        st.write(f"- {s}")
-    # Approximate technical reference levels, not personalized trade recommendations.
-    recent = df.tail(20)
-    support = safe_num(recent["Low"].min())
-    resistance = safe_num(recent["High"].max())
-    r1,r2,r3 = st.columns(3)
-    r1.metric("近 20 根最低點（參考支撐）", fmt_num(support))
-    r2.metric("近 20 根最高點（參考壓力）", fmt_num(resistance))
-    risk_pct = ((close_now-support)/close_now*100) if close_now and support is not None else None
-    r3.metric("現價至參考支撐距離", f"{risk_pct:.2f}%" if risk_pct is not None else "—")
-    st.caption("這些是機械式技術參考，不是個人化買賣指令。停損與部位大小仍需依進場價、持倉、槓桿與可承受損失計算。系統不會在未經歷史回測時宣稱明日上漲勝率。")
+    st.subheader("短線／長線 × 當沖／隔日沖：交易情境與價格區間")
+    horizon_col, style_col = st.columns(2)
+    with horizon_col:
+        horizon = st.radio("分析週期", ["短線（1–5 個交易日）", "長線／波段（20–60 個交易日）"], horizontal=True)
+    with style_col:
+        trade_style = st.radio("交易方式", ["當沖", "隔日沖"], horizontal=True)
 
+    # Use enough daily history for ATR and conditional historical frequencies.
+    daily_hist, _, _ = get_history(code, "2y", "1d")
+    daily = calc_indicators(daily_hist) if not daily_hist.empty else df
+    probs = historical_probabilities(daily) if len(daily) >= 80 else {}
+    today = daily.iloc[-1]
+    c = safe_num(today["Close"])
+    prev_hi = safe_num(today["High"]); prev_lo = safe_num(today["Low"])
+    atr = safe_num(today["ATR14"])
+    if atr is None or atr <= 0:
+        atr = max(c * 0.02, 0.01)
+    pivot = safe_num(today["PIVOT"])
+    s1 = safe_num(today["S1"]); r1 = safe_num(today["R1"])
+    low5 = safe_num(daily.tail(5)["Low"].min())
+    high5 = safe_num(daily.tail(5)["High"].max())
+    low20 = safe_num(daily.tail(20)["Low"].min())
+    high20 = safe_num(daily.tail(20)["High"].max())
+    low60 = safe_num(daily.tail(60)["Low"].min())
+    high60 = safe_num(daily.tail(60)["High"].max())
+    ma20 = safe_num(today["MA20"]); ma60 = safe_num(today["MA60"])
+    if horizon.startswith("短線"):
+        support = min([v for v in [s1, low5, ma20] if v is not None]) if any(v is not None for v in [s1,low5,ma20]) else c-atr
+        resistance = max([v for v in [r1, high5] if v is not None]) if any(v is not None for v in [r1,high5]) else c+atr
+    else:
+        support = min([v for v in [low20, low60, ma60] if v is not None]) if any(v is not None for v in [low20,low60,ma60]) else c-2*atr
+        resistance = max([v for v in [high20, high60] if v is not None]) if any(v is not None for v in [high20,high60]) else c+2*atr
+
+    if trade_style == "當沖":
+        long_entry_low = max(0.01, (s1 if s1 is not None else c-0.5*atr))
+        long_entry_high = min(c, pivot if pivot is not None else c)
+        short_entry_low = max(c, pivot if pivot is not None else c)
+        short_entry_high = r1 if r1 is not None else c+0.5*atr
+        long_stop = max(0.01, min(long_entry_low-0.5*atr, prev_lo-0.1*atr))
+        short_stop = max(short_entry_high+0.5*atr, prev_hi+0.1*atr)
+        long_target = max(resistance, c+0.8*atr)
+        short_target = min(support, c-0.8*atr)
+    else:
+        long_entry_low = max(0.01, support)
+        long_entry_high = min(c, support+0.35*atr)
+        short_entry_low = max(c, resistance-0.35*atr)
+        short_entry_high = resistance
+        long_stop = max(0.01, support-0.8*atr)
+        short_stop = resistance+0.8*atr
+        long_target = max(resistance, c+1.5*atr)
+        short_target = min(support-0.5*atr, c-1.5*atr)
+
+    # Display historical conditional frequencies, explicitly not a guaranteed forecast.
+    if probs:
+        p_intraday = probs["intraday_green"]
+        p_overnight = probs["overnight_up"]
+        sample_n = probs["n"]
+    else:
+        p_intraday = p_overnight = None
+        sample_n = 0
+    shown_prob = p_intraday if trade_style == "當沖" else p_overnight
+    prob_col1, prob_col2, prob_col3 = st.columns(3)
+    prob_col1.metric("歷史條件上漲頻率", f"{shown_prob:.1f}%" if shown_prob is not None else "樣本不足")
+    prob_col2.metric("對應歷史樣本數", f"{sample_n:,} 筆" if sample_n else "—")
+    prob_col3.metric("趨勢評分（-4 至 +4）", f"{int(probs['score']):+d}" if probs else "—")
+    st.caption(
+        f"頻率統計區間：{probs.get('sample_start','—')} 至 {probs.get('sample_end','—')}。"
+        "這是相似技術條件下的歷史比例，不是經驗證的未來預測機率；當沖頻率以隔日開收盤紅黑 K 近似，無法替代逐筆或 5 分 K 回測。"
+    )
+
+    st.markdown("#### 建議觀察進場區間（條件觸發，不是無條件掛單）")
+    def price_range(a,b):
+        if a is None or b is None: return "—"
+        lo, hi = sorted([float(a), float(b)])
+        return f"{lo:,.2f} – {hi:,.2f}"
+    p1,p2 = st.columns(2)
+    with p1:
+        st.markdown("##### 🔴 做多情境")
+        st.metric("建議觀察進場區", price_range(long_entry_low, long_entry_high))
+        st.metric("參考停損價", f"{long_stop:,.2f}")
+        st.metric("預估目標價", f"{long_target:,.2f}")
+        st.caption("條件：價格回測支撐不破，或突破壓力且量能確認；未觸發時不追價。")
+    with p2:
+        st.markdown("##### 🟢 做空情境")
+        st.metric("建議觀察進場區", price_range(short_entry_low, short_entry_high))
+        st.metric("參考停損價", f"{short_stop:,.2f}")
+        st.metric("預估目標價", f"{short_target:,.2f}")
+        st.caption("融券／借券資格、券源、當沖資格與券商限制須另行確認；無法放空時只能觀察，不可直接照此執行。")
+
+    st.markdown("#### 支撐／壓力價位")
+    q1,q2,q3,q4 = st.columns(4)
+    q1.metric("短線支撐", f"{(min(v for v in [s1,low5] if v is not None)):,.2f}" if any(v is not None for v in [s1,low5]) else "—")
+    q2.metric("短線壓力", f"{(max(v for v in [r1,high5] if v is not None)):,.2f}" if any(v is not None for v in [r1,high5]) else "—")
+    q3.metric("波段支撐", f"{low20:,.2f}" if low20 is not None else "—")
+    q4.metric("波段壓力", f"{high20:,.2f}" if high20 is not None else "—")
+    st.warning("價位由近期高低點、均線、ATR 與前一交易日樞紐價推算，屬於規則式參考，不是保證會到達的預測。高波動、跳空、處置股與漲跌停可能使價位失效。")
 with tabs[4]:
+    st.subheader("近一週融資融券與三大法人")
+    st.caption("優先嘗試抓取證交所逐日資料。僅在官方端點回傳資料時顯示；空白代表資料未取得，不代表買賣超為零。")
+    with st.spinner("查詢最近交易日官方籌碼資料…"):
+        chip_df = get_recent_chip_data(code, days=5)
+    if chip_df.empty:
+        st.info("目前無法取得這檔股票近一週的官方籌碼明細。可能是上櫃股票、非交易日、官方端點格式變動或資料源暫時不可用。此時不會以估算值替代。")
+    else:
+        st.markdown("#### 每日成交量與融資融券／法人買賣超")
+        st.dataframe(chip_df, hide_index=True, width="stretch")
+        st.markdown("#### 近一週淨變化摘要")
+        net_cols = ["融資買進(張)","融資賣出(張)","融資餘額(張)","融券買進(張)","融券賣出(張)","融券餘額(張)","外資買賣超(張)","投信買賣超(張)","自營商買賣超(張)"]
+        sumrow = {}
+        for col in net_cols:
+            vals = pd.to_numeric(chip_df[col], errors="coerce").dropna()
+            sumrow[col] = f"{vals.iloc[0]:+,.0f}" if col.endswith("買賣超(張)") and len(vals) else (f"{vals.iloc[-1]:,.0f}" if len(vals) else "—")
+        summary_df = pd.DataFrame([{"指標":k, "數值":v, "說明":"法人欄位為每日買賣超；餘額欄位為當日餘額" if "餘額" in k else "資料列中最近可取得值"} for k,v in sumrow.items()])
+        st.dataframe(summary_df, hide_index=True, width="stretch")
+    st.caption("注意：本版籌碼串接以 TWSE 官方公開端點為主，對 TPEx 上櫃股票的歷史籌碼尚未完整支援。欄位格式若因官方 API 調整，需同步更新解析器。")
+
+with tabs[5]:
     st.subheader("資料來源與品質")
     st.write(f"- 歷史 K 線：Yahoo Finance（{symbol}）")
     st.write("- 上市最新日行情補充：TWSE OpenAPI")
@@ -477,4 +735,4 @@ with tabs[4]:
     st.warning("免費資料不等於即時行情。若來源未更新、回傳欄位變更或遭限流，畫面可能缺資料；請以證交所、櫃買中心及公開資訊觀測站公告為準。")
 
 st.markdown("---")
-st.caption("台股專業操盤分析系統｜研究輔助用途，不構成投資建議。")
+st.caption("台股專業操盤分析系統｜研究輔助用途；所有機率與價位均為歷史統計／規則式估算，不構成投資建議。")
